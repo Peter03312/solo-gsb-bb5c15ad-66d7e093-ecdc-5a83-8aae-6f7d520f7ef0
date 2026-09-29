@@ -512,3 +512,244 @@ def test_refund_audit_requires_as_of(client):
     resp = client.get("/accounts/acct-1/refund-audit")
     assert resp.status_code == 422
 
+
+# --------------------------------------------------------- negative balances
+
+
+def gaps(client, account="acct-1", start="2026-09-01T00:00:00Z",
+         end="2026-09-30T23:59:59Z", currency="USD"):
+    resp = client.get(
+        f"/accounts/{account}/negative-balances",
+        params={"currency": currency, "start": start, "end": end},
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_negative_balances_empty_ledger_returns_nothing(client):
+    data = gaps(client, account="ghost")
+    assert data["opening_balance"] == "0.00"
+    assert data["periods"] == []
+
+
+def test_negative_balances_positive_ledger_returns_nothing(client):
+    post_event(client, make_event("i1", amount="100.00", occurred_at="2026-09-01T10:00:00Z"))
+    post_event(client, make_event("r1", type_="refund", amount="40.00",
+                                  occurred_at="2026-09-02T10:00:00Z",
+                                  reference_event_id="i1"))
+    assert gaps(client)["periods"] == []
+
+
+def test_negative_balances_single_gap_with_recovery(client):
+    post_event(client, make_event("i1", amount="100.00", occurred_at="2026-09-01T10:00:00Z"))
+    post_event(client, make_event("r1", type_="refund", amount="130.00",
+                                  occurred_at="2026-09-02T10:00:00Z",
+                                  reference_event_id="i1"))  # -30
+    post_event(client, make_event("i2", amount="40.00", occurred_at="2026-09-03T10:00:00Z"))
+
+    data = gaps(client)
+    assert data["opening_balance"] == "0.00"
+    assert len(data["periods"]) == 1
+    p = data["periods"][0]
+    assert p == {
+        "start": "2026-09-02T10:00:00",
+        "recovered_at": "2026-09-03T10:00:00",
+        "minimum_balance": "-30.00",
+    }
+
+
+def test_negative_balances_unrecovered_gap_has_null_recovery_and_minimum(client):
+    post_event(client, make_event("i1", amount="100.00", occurred_at="2026-09-01T10:00:00Z"))
+    post_event(client, make_event("r1", type_="refund", amount="130.00",
+                                  occurred_at="2026-09-02T10:00:00Z",
+                                  reference_event_id="i1"))  # -30
+    post_event(client, make_event("r2", type_="refund", amount="20.00",
+                                  occurred_at="2026-09-03T10:00:00Z",
+                                  reference_event_id="i1"))  # -50 (lowest)
+    post_event(client, make_event("i2", amount="10.00", occurred_at="2026-09-04T10:00:00Z"))  # -40
+
+    p = gaps(client)["periods"]
+    assert len(p) == 1
+    assert p[0]["start"] == "2026-09-02T10:00:00"
+    assert p[0]["recovered_at"] is None
+    assert p[0]["minimum_balance"] == "-50.00"
+
+
+def test_negative_balances_multiple_separate_gaps(client):
+    # 0 -> +100 -> -20 -> +10 -> -5 -> +20
+    timeline = [
+        ("i1", "income", "100.00", "2026-09-01T10:00:00Z", None),
+        ("r1", "refund", "120.00", "2026-09-02T10:00:00Z", "i1"),
+        ("i2", "income", "30.00", "2026-09-03T10:00:00Z", None),
+        ("r2", "refund", "15.00", "2026-09-04T10:00:00Z", "i2"),
+        ("i3", "income", "25.00", "2026-09-05T10:00:00Z", None),
+    ]
+    for eid, typ, amt, ts, ref in timeline:
+        post_event(client, make_event(eid, type_=typ, amount=amt, occurred_at=ts,
+                                      reference_event_id=ref))
+
+    periods = gaps(client)["periods"]
+    assert [(p["start"], p["recovered_at"], p["minimum_balance"]) for p in periods] == [
+        ("2026-09-02T10:00:00", "2026-09-03T10:00:00", "-20.00"),
+        ("2026-09-04T10:00:00", "2026-09-05T10:00:00", "-5.00"),
+    ]
+
+
+def test_negative_balances_opening_balance_is_net_of_pre_start_events(client):
+    # Everything happens before the window; balance is -70 at start.
+    post_event(client, make_event("i1", amount="50.00", occurred_at="2026-08-30T10:00:00Z"))
+    post_event(client, make_event("r1", type_="refund", amount="120.00",
+                                  occurred_at="2026-08-31T10:00:00Z",
+                                  reference_event_id="i1"))
+    post_event(client, make_event("i2", amount="50.00",
+                                  occurred_at="2026-09-02T10:00:00Z"))  # -20
+    post_event(client, make_event("i3", amount="30.00",
+                                  occurred_at="2026-09-03T10:00:00Z"))  # +10
+
+    data = gaps(client, start="2026-09-01T00:00:00Z", end="2026-09-10T00:00:00Z")
+    assert data["opening_balance"] == "-70.00"
+    p = data["periods"]
+    assert len(p) == 1
+    assert p[0]["start"] == "2026-09-01T00:00:00"  # clamped to window start
+    assert p[0]["recovered_at"] == "2026-09-03T10:00:00"
+    assert p[0]["minimum_balance"] == "-70.00"
+
+
+def test_negative_balances_window_is_half_open(client):
+    # Gap opens before the window; recovery lands exactly on `end` -> still open.
+    post_event(client, make_event("i1", amount="100.00", occurred_at="2026-08-31T10:00:00Z"))
+    post_event(client, make_event("r1", type_="refund", amount="130.00",
+                                  occurred_at="2026-08-31T12:00:00Z",
+                                  reference_event_id="i1"))
+    post_event(client, make_event("i2", amount="30.00",
+                                  occurred_at="2026-09-05T10:00:00Z"))
+
+    data = gaps(client, start="2026-09-01T00:00:00Z", end="2026-09-05T10:00:00Z")
+    assert len(data["periods"]) == 1
+    assert data["periods"][0]["recovered_at"] is None
+    assert data["periods"][0]["minimum_balance"] == "-30.00"
+
+    # One second later the recovery event is inside and the gap closes.
+    data = gaps(client, start="2026-09-01T00:00:00Z", end="2026-09-05T10:00:01Z")
+    assert data["periods"][0]["recovered_at"] == "2026-09-05T10:00:00"
+
+
+def test_negative_balances_events_at_start_are_inside_window(client):
+    # No pre-start events: an event exactly at start opens the gap at start.
+    post_event(client, make_event("r1", type_="refund", amount="10.00",
+                                  occurred_at="2026-09-01T00:00:00Z"))
+    post_event(client, make_event("i1", amount="10.00",
+                                  occurred_at="2026-09-01T01:00:00Z"))
+    data = gaps(client, start="2026-09-01T00:00:00Z", end="2026-09-02T00:00:00Z")
+    assert data["opening_balance"] == "0.00"
+    p = data["periods"][0]
+    assert p["start"] == "2026-09-01T00:00:00"
+    assert p["recovered_at"] == "2026-09-01T01:00:00"
+    assert p["minimum_balance"] == "-10.00"
+
+
+def test_negative_balances_same_timestamp_events_are_netted_first(client):
+    # At 08:00 a -60 refund and a +60 income share a timestamp; starting from
+    # +10 the merged delta is 0, so no gap may appear despite event order.
+    post_event(client, make_event("i0", amount="10.00", occurred_at="2026-09-01T07:00:00Z"))
+    post_event(client, make_event("r1", type_="refund", amount="60.00",
+                                  occurred_at="2026-09-01T08:00:00Z",
+                                  reference_event_id="i0"))
+    post_event(client, make_event("i1", amount="60.00",
+                                  occurred_at="2026-09-01T08:00:00Z"))
+    # Insertion order puts the refund first; netting must erase the phantom dip.
+    assert gaps(client)["periods"] == []
+
+
+def test_negative_balances_same_timestamp_net_negative_opens_gap(client):
+    post_event(client, make_event("i0", amount="10.00", occurred_at="2026-09-01T07:00:00Z"))
+    post_event(client, make_event("i1", amount="20.00",
+                                  occurred_at="2026-09-01T08:00:00Z"))
+    post_event(client, make_event("r1", type_="refund", amount="60.00",
+                                  occurred_at="2026-09-01T08:00:00Z",
+                                  reference_event_id="i1"))  # net at 08:00: -40 -> -30
+    post_event(client, make_event("i2", amount="30.00",
+                                  occurred_at="2026-09-01T09:00:00Z"))  # -> 0
+    p = gaps(client)["periods"]
+    assert len(p) == 1
+    assert p[0]["start"] == "2026-09-01T08:00:00"
+    assert p[0]["recovered_at"] == "2026-09-01T09:00:00"
+    assert p[0]["minimum_balance"] == "-30.00"
+
+
+def test_negative_balances_exact_zero_counts_as_recovered(client):
+    post_event(client, make_event("i1", amount="100.00", occurred_at="2026-09-01T07:00:00Z"))
+    post_event(client, make_event("r1", type_="refund", amount="130.00",
+                                  occurred_at="2026-09-01T08:00:00Z",
+                                  reference_event_id="i1"))
+    post_event(client, make_event("i2", amount="30.00",
+                                  occurred_at="2026-09-01T09:00:00Z"))
+    p = gaps(client)["periods"]
+    assert len(p) == 1
+    assert p[0]["recovered_at"] == "2026-09-01T09:00:00"
+    assert p[0]["minimum_balance"] == "-30.00"
+
+
+def test_negative_balances_late_backfill_revises_history(client):
+    # First query: the day-01 income is missing (not yet delivered); the refund
+    # alone produces a -120 gap.
+    post_event(client, make_event("r1", type_="refund", amount="120.00",
+                                  occurred_at="2026-09-01T12:00:00Z",
+                                  reference_event_id="late-income"))
+    p = gaps(client)["periods"]
+    assert len(p) == 1
+    assert p[0]["start"] == "2026-09-01T12:00:00"
+    assert p[0]["minimum_balance"] == "-120.00"
+    assert p[0]["recovered_at"] is None
+
+    # Backfill the referenced income at an earlier business time; replaying
+    # the immutable log now yields a +0 (100 - 120 = -20 still negative)...
+    post_event(client, make_event("late-income", amount="100.00",
+                                  occurred_at="2026-09-01T10:00:00Z"))
+    p = gaps(client)["periods"]
+    assert len(p) == 1
+    assert p[0]["start"] == "2026-09-01T12:00:00"
+    assert p[0]["minimum_balance"] == "-20.00"
+
+    # A larger backfill removes the gap from history entirely.
+    post_event(client, make_event("late-topup", amount="20.00",
+                                  occurred_at="2026-09-01T09:00:00Z"))
+    assert gaps(client)["periods"] == []
+
+
+def test_negative_balances_currency_is_isolated_and_normalized(client):
+    post_event(client, make_event("u1", amount="10.00", currency="USD",
+                                  occurred_at="2026-09-01T10:00:00Z"))
+    post_event(client, make_event("e1", amount="10.00", currency="EUR",
+                                  occurred_at="2026-09-01T10:00:00Z"))
+    post_event(client, make_event("e2", type_="refund", amount="50.00", currency="EUR",
+                                  occurred_at="2026-09-02T10:00:00Z",
+                                  reference_event_id="e1"))
+    # Lowercase query param is accepted and normalized.
+    assert gaps(client, currency="usd")["periods"] == []
+    eur = gaps(client, currency="EUR")
+    assert eur["currency"] == "EUR"
+    assert eur["periods"][0]["minimum_balance"] == "-40.00"
+
+
+def test_negative_balances_end_not_later_than_start_rejected(client):
+    resp = client.get("/accounts/acct-1/negative-balances", params={
+        "currency": "USD",
+        "start": "2026-09-10T00:00:00Z",
+        "end": "2026-09-10T00:00:00Z",
+    })
+    assert resp.status_code == 422
+    assert "later than start" in resp.json()["detail"]
+
+    resp = client.get("/accounts/acct-1/negative-balances", params={
+        "currency": "USD",
+        "start": "2026-09-11T00:00:00Z",
+        "end": "2026-09-10T00:00:00Z",
+    })
+    assert resp.status_code == 422
+
+
+def test_negative_balances_requires_query_parameters(client):
+    resp = client.get("/accounts/acct-1/negative-balances")
+    assert resp.status_code == 422
+

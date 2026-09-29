@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -153,6 +153,118 @@ def get_balances(session: Session, account_id: str, recompute: bool = False) -> 
     return {
         r.currency: {"balance": to_decimal_str(r.balance_minor), "event_count": r.event_count}
         for r in sorted(rows, key=lambda r: r.currency)
+    }
+
+
+def negative_balance_periods(
+    session: Session,
+    account_id: str,
+    currency: str,
+    start: datetime,
+    end: datetime,
+) -> dict:
+    """Locate every negative-balance episode (funding gap) of one account +
+    currency over the half-open business-time window ``[start, end)``.
+
+    The opening balance is the net of *all* events with ``occurred_at < start``
+    (income +, refund -); an empty ledger therefore opens at zero. Events are
+    replayed in business time and events sharing one ``occurred_at`` are folded
+    into a single net delta before the balance is judged, so intra-timestamp
+    arrival/insertion order can never fabricate a gap. The query is a pure
+    replay over the current event log, so late or backfilled events
+    automatically revise history on the next call.
+
+    A gap is reported with its start time, its recovery time (``None`` if the
+    balance is still negative at ``end``) and the lowest balance reached while
+    it was open. If the opening balance is already negative, the episode starts
+    at ``start`` (its earlier onset lies outside the query window).
+    """
+    opening = (
+        session.scalar(
+            select(
+                func.coalesce(
+                    func.sum(
+                        case((Event.type == "income", 1), else_=-1) * Event.amount_minor
+                    ),
+                    0,
+                )
+            ).where(
+                Event.account_id == account_id,
+                Event.currency == currency,
+                Event.occurred_at < start,
+            )
+        )
+        or 0
+    )
+
+    events = list(
+        session.scalars(
+            select(Event)
+            .where(
+                Event.account_id == account_id,
+                Event.currency == currency,
+                Event.occurred_at >= start,
+                Event.occurred_at < end,
+            )
+            .order_by(Event.occurred_at, Event.id)
+        )
+    )
+
+    # Fold events at the same business timestamp into one net change first;
+    # only afterwards may the balance be judged negative.
+    deltas: list[tuple[datetime, int]] = []
+    for e in events:
+        delta = SIGNED[e.type] * e.amount_minor
+        if deltas and deltas[-1][0] == e.occurred_at:
+            deltas[-1] = (e.occurred_at, deltas[-1][1] + delta)
+        else:
+            deltas.append((e.occurred_at, delta))
+
+    periods: list[dict] = []
+    balance = opening
+    open_start: datetime | None = None
+    lowest = 0
+
+    if balance < 0:
+        # Negative already at the window boundary: the visible episode begins
+        # at start regardless of when it actually went negative.
+        open_start = start
+        lowest = balance
+
+    for ts, delta in deltas:
+        balance += delta
+        if open_start is None:
+            if balance < 0:
+                open_start = ts
+                lowest = balance
+        else:
+            lowest = min(lowest, balance)
+            if balance >= 0:
+                periods.append(
+                    {
+                        "start": open_start,
+                        "recovered_at": ts,
+                        "minimum_balance": lowest,
+                    }
+                )
+                open_start = None
+                lowest = 0
+
+    if open_start is not None:
+        periods.append(
+            {
+                "start": open_start,
+                "recovered_at": None,
+                "minimum_balance": lowest,
+            }
+        )
+
+    return {
+        "account_id": account_id,
+        "currency": currency,
+        "window": {"start": start, "end": end},
+        "opening_balance": opening,
+        "periods": periods,
     }
 
 

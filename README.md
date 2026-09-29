@@ -169,6 +169,52 @@ curl "http://localhost:8000/accounts/acct-1/refund-audit?as_of=2026-09-10T23:59:
 - **排序**：`incomes` 按收入事件 ID、`anomalies` 按异常退款事件 ID 升序，回放结果稳定。
 - 金额全程以整数分计算，输出为十进制字符串（如 `"70.00"`）。
 
+### 5. 资金缺口（负余额时段）`GET /accounts/{account_id}/negative-balances`
+
+按账户、币种与起止**业务时间**（`occurred_at`）查询余额曾经为负的时段。区间**左闭右开** `[start, end)`：起点事件计入、终点事件不计入。
+
+```bash
+curl -G "http://localhost:8000/accounts/acct-1/negative-balances" \
+  --data-urlencode "currency=USD" \
+  --data-urlencode "start=2026-09-01T00:00:00Z" \
+  --data-urlencode "end=2026-10-01T00:00:00Z"
+```
+
+响应（无缺口时 `periods` 为空列表）：
+
+```json
+{
+  "account_id": "acct-1",
+  "currency": "USD",
+  "window": {"start": "2026-09-01T00:00:00", "end": "2026-10-01T00:00:00"},
+  "opening_balance": "-70.00",
+  "periods": [
+    {
+      "start": "2026-09-01T00:00:00",
+      "recovered_at": "2026-09-03T09:00:00",
+      "minimum_balance": "-70.00"
+    },
+    {
+      "start": "2026-09-05T09:00:00",
+      "recovered_at": null,
+      "minimum_balance": "-80.00"
+    }
+  ]
+}
+```
+
+规则：
+
+- **期初余额**：起点之前（`occurred_at < start`）全部事件的净额，收入加、退款减；空账本 / 无该币种事件时按零余额处理，并在 `opening_balance` 中回显。
+- **缺口区间**：每段负余额记录 `start`（进入负值的业务时间）、`recovered_at`（余额恢复到 `>= 0` 的业务时间；到终点仍为负则为 `null`）、`minimum_balance`（区间内最低余额，即缺口峰值，负数字符串）。缺口区间本身也是左闭右开：`[start, recovered_at)`。
+- **起点已为负**：缺口 `start` 取查询起点（实际转负时刻在窗口之外不可见），`minimum_balance` 包含期初余额。
+- **同一业务时间先合并再判断**：`occurred_at` 相同的事件先折叠成一笔净变动，再判断余额符号，到达 / 入库顺序不会制造虚假缺口（例如同一时刻先退 60 又收 60，净额为 0，不产生缺口）。
+- **乱序 / 补录自愈**：查询是对当前事件日志的纯回放，不依赖任何缓存投影；迟到或补录的事件落库后，再次查询即自动修正历史结果。
+- **恢复判定**：余额恰好回到 `0.00` 视为恢复。
+- **币种隔离**：`currency` 为必填查询参数（大小写不敏感，输出为大写），不同币种互不影响。
+- **参数校验**：`end` 不晚于（`<=`）`start` 时返回 `422`；缺少 `currency` / `start` / `end` 同样 `422`。
+- 金额全程整数分运算，输出为两位小数字符串。
+
 
 ## 设计要点
 
@@ -187,7 +233,7 @@ app/
   schemas.py     Pydantic 请求/响应模型
   security.py    HMAC 签名验证
   services.py    幂等入账、余额折叠、对账核心逻辑
-  routers/       webhooks / balances / reconcile / refund-audit 路由
+  routers/       webhooks / balances / reconcile / refund-audit / negative-balances 路由
   main.py        应用工厂
 tests/test_api.py
 Dockerfile  docker-compose.yml  requirements.txt

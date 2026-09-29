@@ -181,3 +181,24 @@ class RefundAuditResponse(BaseModel):
     as_of: datetime
     incomes: list[IncomeRefundAudit]
     anomalies: list[RefundAnomaly]
+
+
+class NegativeBalancePeriod(BaseModel):
+    """One half-open [start, recovered_at) interval where the balance was < 0.
+
+    ``recovered_at`` is null when the balance has not returned to >= 0 by the
+    window's end. ``minimum_balance`` is the lowest (most negative) balance
+    reached while the gap was open.
+    """
+
+    start: datetime
+    recovered_at: datetime | None
+    minimum_balance: str
+
+
+class NegativeBalanceResponse(BaseModel):
+    account_id: str
+    currency: str
+    window: dict[str, datetime]
+    opening_balance: str
+    periods: list[NegativeBalancePeriod]
