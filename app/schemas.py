@@ -181,3 +181,21 @@ class RefundAuditResponse(BaseModel):
     as_of: datetime
     incomes: list[IncomeRefundAudit]
     anomalies: list[RefundAnomaly]
+
+
+class NegativeBalancePeriod(BaseModel):
+    """One contiguous period where the running balance was below zero."""
+
+    start: datetime
+    # Business timestamp at which the balance recovered to >= 0;
+    # None means the account was still negative at the window end.
+    recovered_at: datetime | None
+    min_balance: str
+
+
+class NegativeBalancePeriodsResponse(BaseModel):
+    account_id: str
+    currency: str
+    window: dict[str, datetime]
+    opening_balance: str
+    gaps: list[NegativeBalancePeriod]

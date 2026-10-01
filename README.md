@@ -1,6 +1,6 @@
 # Webhook Ledger API
 
-一个 Python (FastAPI) 账本服务：接收带 HMAC 签名的收入 / 退款 webhook 事件，按事件 ID 幂等入账，支持乱序事件的余额折叠，按账户查询余额，并可重放时间窗事件与上游系统对账。
+一个 Python (FastAPI) 账本服务：接收带 HMAC 签名的收入 / 退款 webhook 事件，按事件 ID 幂等入账，支持乱序事件的余额折叠，按账户查询余额，可重放时间窗事件与上游系统对账，并可按账户 + 币种回放负余额（资金缺口）时段。
 
 ## 快速启动（单条命令）
 
@@ -169,6 +169,37 @@ curl "http://localhost:8000/accounts/acct-1/refund-audit?as_of=2026-09-10T23:59:
 - **排序**：`incomes` 按收入事件 ID、`anomalies` 按异常退款事件 ID 升序，回放结果稳定。
 - 金额全程以整数分计算，输出为十进制字符串（如 `"70.00"`）。
 
+### 5. 资金缺口时段 `GET /accounts/{account_id}/negative-balance-periods?currency=USD&start=...&end=...`
+
+按账户 + 币种 + 业务时间窗口 `[start, end)`（左闭右开）回放账本，找出运行余额为负的连续时段：
+
+```bash
+curl "http://localhost:8000/accounts/acct-1/negative-balance-periods?currency=USD&start=2026-09-01T00:00:00Z&end=2026-10-01T00:00:00Z"
+```
+
+```json
+{
+  "account_id": "acct-1",
+  "currency": "USD",
+  "window": {"start": "2026-09-01T00:00:00", "end": "2026-10-01T00:00:00"},
+  "opening_balance": "0.00",
+  "gaps": [
+    {"start": "2026-09-02T10:00:00",
+     "recovered_at": "2026-09-03T09:00:00",
+     "min_balance": "-80.00"}
+  ]
+}
+```
+
+规则：
+
+- **期初余额**：`start` 之前全部事件的净额（收入加、退款减）；空账本按零余额处理。
+- **同一业务时间合并**：同一 `occurred_at` 的事件先合并成一笔净变动再判断，避免同一时刻内的事件顺序造成虚假缺口。
+- **缺口判定**：余额跌破 0 开启一段缺口，恢复到 ≥ 0 的业务时间记为 `recovered_at`；窗口结束仍未恢复则 `recovered_at` 为 `null`。`start` 时期初余额已为负的，缺口从 `start` 开始记录。
+- **迟到 / 补录自愈**：结果是对事件日志的纯回放，迟到或补录的事件在再次查询时自动修正历史缺口（缩短、拆分或消除）。
+- `min_balance` 为该段缺口内的最低余额；金额均为两位小数字符串。无缺口时 `gaps` 为空列表。
+- `end` 不晚于 `start` → `422`。
+
 
 ## 设计要点
 
@@ -187,7 +218,7 @@ app/
   schemas.py     Pydantic 请求/响应模型
   security.py    HMAC 签名验证
   services.py    幂等入账、余额折叠、对账核心逻辑
-  routers/       webhooks / balances / reconcile / refund-audit 路由
+  routers/       webhooks / balances / reconcile / refund-audit / negative-balance-periods 路由
   main.py        应用工厂
 tests/test_api.py
 Dockerfile  docker-compose.yml  requirements.txt

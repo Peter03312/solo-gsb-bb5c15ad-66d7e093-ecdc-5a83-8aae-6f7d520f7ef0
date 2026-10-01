@@ -391,3 +391,85 @@ def refund_audit(session: Session, account_id: str, as_of: datetime) -> dict:
         "incomes": income_rows,
         "anomalies": anomalies,
     }
+
+
+def negative_balance_periods(
+    session: Session,
+    account_id: str,
+    currency: str,
+    start: datetime,
+    end: datetime,
+) -> dict:
+    """Contiguous negative-balance periods for one account+currency over the
+    business-time window [start, end).
+
+    Pure replay from the append-only event log, so late or backfilled events
+    automatically correct the result on the next query:
+
+    * The opening balance is the signed net (income +, refund -) of every
+      event with ``occurred_at < start``; an empty ledger means zero.
+    * Events inside the window are merged into one net change per business
+      timestamp before being applied, so same-timestamp batches can never
+      create spurious gaps that depend on arrival/order.
+    * A gap opens when the running balance drops below zero and closes at the
+      business timestamp whose net change brings it back to >= 0. If the
+      opening balance is already negative the gap is recorded from ``start``;
+      a gap still open at ``end`` is returned with ``recovered_at = None``.
+    """
+    prior_events = session.scalars(
+        select(Event).where(
+            Event.account_id == account_id,
+            Event.currency == currency,
+            Event.occurred_at < start,
+        )
+    )
+    opening = sum(SIGNED[e.type] * e.amount_minor for e in prior_events)
+
+    window_events = session.scalars(
+        select(Event).where(
+            Event.account_id == account_id,
+            Event.currency == currency,
+            Event.occurred_at >= start,
+            Event.occurred_at < end,
+        )
+    )
+    # Merge same-timestamp events into a single net change first.
+    net_by_ts: dict[datetime, int] = {}
+    for e in window_events:
+        net_by_ts[e.occurred_at] = net_by_ts.get(e.occurred_at, 0) + SIGNED[e.type] * e.amount_minor
+
+    balance = opening
+    gaps: list[dict] = []
+    open_gap: dict | None = None
+    if balance < 0:
+        # Already negative at the window start: record the gap from start.
+        open_gap = {"start": start, "min_balance": balance}
+
+    for ts in sorted(net_by_ts):
+        balance += net_by_ts[ts]
+        if open_gap is None:
+            if balance < 0:
+                open_gap = {"start": ts, "min_balance": balance}
+        else:
+            open_gap["min_balance"] = min(open_gap["min_balance"], balance)
+            if balance >= 0:
+                gaps.append({**open_gap, "recovered_at": ts})
+                open_gap = None
+
+    if open_gap is not None:
+        gaps.append({**open_gap, "recovered_at": None})
+
+    return {
+        "account_id": account_id,
+        "currency": currency,
+        "window": {"start": start, "end": end},
+        "opening_balance": to_decimal_str(opening),
+        "gaps": [
+            {
+                "start": g["start"],
+                "recovered_at": g["recovered_at"],
+                "min_balance": to_decimal_str(g["min_balance"]),
+            }
+            for g in gaps
+        ],
+    }

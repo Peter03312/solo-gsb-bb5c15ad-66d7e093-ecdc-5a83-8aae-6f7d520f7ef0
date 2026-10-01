@@ -44,3 +44,12 @@ curl -s -X POST "$BASE/reconcile" -H 'Content-Type: application/json' -d '{
     {"event_id": "evt-2", "type": "refund", "amount": "30.00"}
   ]
 }'; echo
+
+echo "==> refund evt-3 (-120.00 USD: pushes the balance negative)"
+send_event '{"event_id":"evt-3","account_id":"acct-demo","type":"refund","amount":"120.00","currency":"USD","occurred_at":"2026-09-21T09:00:00Z","reference_event_id":"evt-1"}'
+
+echo "==> income evt-4 (+200.00 USD: recovers the gap)"
+send_event '{"event_id":"evt-4","account_id":"acct-demo","type":"income","amount":"200.00","currency":"USD","occurred_at":"2026-09-22T09:00:00Z"}'
+
+echo "==> negative-balance periods (funding gaps) for September"
+curl -s "$BASE/accounts/acct-demo/negative-balance-periods?currency=USD&start=2026-09-01T00:00:00Z&end=2026-10-01T00:00:00Z"; echo
